@@ -1,0 +1,16 @@
+[Unit]
+Description=X120x UPS Monitoring (v2 canary, no shutdown)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/pi/x120x/merged_v2.py --dry-run --no-pld
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
