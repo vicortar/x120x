@@ -1,0 +1,19 @@
+[Unit]
+Description=X1201 UPS Monitoring and Safe Shutdown Service (v2)
+After=network.target multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/x120x
+ExecStart=/usr/bin/python3 -u /home/pi/x120x/merged_v2.py --pidfile /var/run/X1200.pid --min-capacity-shutdown 30 --min-voltage-shutdown 3.2 --sleep 60 --ac-loss-confirmations 2 --shutdown-confirmations 3
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
