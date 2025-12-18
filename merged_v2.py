@@ -16,6 +16,8 @@ DEFAULT_MIN_CAPACITY_SHUTDOWN = 30.0  # Shutdown if capacity below this % while 
 DEFAULT_MIN_VOLTAGE_SHUTDOWN = 3.20  # Shutdown if voltage below this V while on battery
 DEFAULT_SLEEP_TIME = 60  # Seconds between checks
 DEFAULT_PIDFILE = "/var/run/X1200_v2.pid"
+DEFAULT_AC_LOSS_CONFIRMATIONS = 1
+DEFAULT_SHUTDOWN_CONFIRMATIONS = 1
 
 I2C_BUS_NUMBER = 1
 I2C_ADDRESS = 0x36
@@ -128,6 +130,24 @@ def parse_args():
     )
     parser.add_argument("--pidfile", default=DEFAULT_PIDFILE, help=f"PID file path (default: {DEFAULT_PIDFILE}).")
     parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="Number of loop iterations to run (0 = run forever). Useful for testing.",
+    )
+    parser.add_argument(
+        "--ac-loss-confirmations",
+        type=int,
+        default=DEFAULT_AC_LOSS_CONFIRMATIONS,
+        help=f"Consecutive PLD=0 reads required to consider AC lost (default: {DEFAULT_AC_LOSS_CONFIRMATIONS}).",
+    )
+    parser.add_argument(
+        "--shutdown-confirmations",
+        type=int,
+        default=DEFAULT_SHUTDOWN_CONFIRMATIONS,
+        help=f"Consecutive critical readings required before shutdown (default: {DEFAULT_SHUTDOWN_CONFIRMATIONS}).",
+    )
+    parser.add_argument(
         "--min-capacity-shutdown",
         type=float,
         default=DEFAULT_MIN_CAPACITY_SHUTDOWN,
@@ -148,6 +168,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def shutdown_now(dry_run):
+    if dry_run:
+        log("DRY-RUN: shutdown suppressed (would run: shutdown -h now)")
+        return
+
+    cmd = ["shutdown", "-h", "now"]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+
+    try:
+        rc = call(cmd)
+        log(f"Shutdown command exited with code {rc}.")
+    except FileNotFoundError as e:
+        log(f"Shutdown command not found: {e}")
+    except Exception as e:
+        log(f"Shutdown command failed: {e}")
+
+
 def main():
     args = parse_args()
 
@@ -162,6 +200,15 @@ def main():
         log("DRY-RUN enabled: shutdown will NOT be executed.")
     if args.no_pld:
         log("NO-PLD enabled: will not read AC/adapter state from GPIO.")
+    if args.iterations < 0:
+        log("Invalid --iterations (must be >= 0). Exiting.")
+        sys.exit(2)
+    if args.ac_loss_confirmations < 1:
+        log("Invalid --ac-loss-confirmations (must be >= 1). Exiting.")
+        sys.exit(2)
+    if args.shutdown_confirmations < 1:
+        log("Invalid --shutdown-confirmations (must be >= 1). Exiting.")
+        sys.exit(2)
 
     ensure_single_instance(pidfile)
 
@@ -184,8 +231,13 @@ def main():
         log(
             f"Shutdown policy (only when on battery): capacity < {args.min_capacity_shutdown}% OR voltage < {args.min_voltage_shutdown}V.",
         )
+        log(
+            f"Confirmations: AC loss={args.ac_loss_confirmations}, shutdown={args.shutdown_confirmations}.",
+        )
 
         ac_power_lost_consecutive_checks = 0
+        critical_consecutive_checks = 0
+        iterations_remaining = args.iterations
 
         while True:
             if args.no_pld:
@@ -195,48 +247,89 @@ def main():
                 ac_power_state = pld_line.get_value()
                 ac_power_state_str = "Plugged in" if ac_power_state == 1 else "Unplugged"
 
-            voltage = read_voltage(bus)
-            capacity = read_capacity(bus)
-            battery_status_str = get_battery_status(voltage, args.min_voltage_shutdown)
-
             raw_pld = "N/A" if ac_power_state is None else str(ac_power_state)
-            log(
-                f"Capacity: {capacity:.2f}% ({battery_status_str}), AC Power State: {ac_power_state_str} (Raw PLD: {raw_pld}), Voltage: {voltage:.2f}V",
-            )
+            voltage = None
+            capacity = None
+            try:
+                voltage = read_voltage(bus)
+                capacity = read_capacity(bus)
+            except OSError as e:
+                log(f"I2C read error: {e}")
+            except Exception as e:
+                log(f"Unexpected sensor read error: {e}")
 
-            shutdown_now = False
+            if voltage is None or capacity is None:
+                log(
+                    f"Capacity: N/A, AC Power State: {ac_power_state_str} (Raw PLD: {raw_pld}), Voltage: N/A",
+                )
+                critical_consecutive_checks = 0
+            else:
+                if not (0.0 <= capacity <= 100.0):
+                    log(
+                        f"Out-of-range capacity reading: {capacity:.2f}%. Ignoring this sample.",
+                    )
+                    critical_consecutive_checks = 0
+                    capacity = None
+                if not (0.0 < voltage < 6.0):
+                    log(
+                        f"Out-of-range voltage reading: {voltage:.2f}V. Ignoring this sample.",
+                    )
+                    critical_consecutive_checks = 0
+                    voltage = None
+
+            if voltage is not None and capacity is not None:
+                battery_status_str = get_battery_status(voltage, args.min_voltage_shutdown)
+                log(
+                    f"Capacity: {capacity:.2f}% ({battery_status_str}), AC Power State: {ac_power_state_str} (Raw PLD: {raw_pld}), Voltage: {voltage:.2f}V",
+                )
+
             shutdown_reason = ""
+            should_shutdown = False
 
             if ac_power_state == 0:
                 ac_power_lost_consecutive_checks += 1
                 log(
                     f"UPS is unplugged or AC power loss detected. (Consecutive check: {ac_power_lost_consecutive_checks})",
                 )
-                if capacity < args.min_capacity_shutdown:
-                    shutdown_reason = (
-                        f"due to critical battery level ({capacity:.2f}% < {args.min_capacity_shutdown}%)."
-                    )
-                    shutdown_now = True
-                elif voltage < args.min_voltage_shutdown:
-                    shutdown_reason = (
-                        f"due to critical battery voltage ({voltage:.2f}V < {args.min_voltage_shutdown}V)."
-                    )
-                    shutdown_now = True
+                if ac_power_lost_consecutive_checks >= args.ac_loss_confirmations and voltage is not None and capacity is not None:
+                    if capacity < args.min_capacity_shutdown:
+                        shutdown_reason = (
+                            f"due to critical battery level ({capacity:.2f}% < {args.min_capacity_shutdown}%)."
+                        )
+                        should_shutdown = True
+                    elif voltage < args.min_voltage_shutdown:
+                        shutdown_reason = (
+                            f"due to critical battery voltage ({voltage:.2f}V < {args.min_voltage_shutdown}V)."
+                        )
+                        should_shutdown = True
             elif ac_power_state == 1:
                 if ac_power_lost_consecutive_checks > 0:
                     log("AC Power restored. Resetting AC loss counter.")
                 ac_power_lost_consecutive_checks = 0
+                critical_consecutive_checks = 0
             else:
                 ac_power_lost_consecutive_checks = 0
+                critical_consecutive_checks = 0
 
-            if shutdown_now:
+            if should_shutdown:
+                critical_consecutive_checks += 1
+                log(
+                    f"Critical condition detected ({critical_consecutive_checks}/{args.shutdown_confirmations}).",
+                )
+            else:
+                critical_consecutive_checks = 0
+
+            if critical_consecutive_checks >= args.shutdown_confirmations:
                 shutdown_message = f"Critical condition met {shutdown_reason} Initiating shutdown."
                 log(shutdown_message)
-                if args.dry_run:
-                    log("DRY-RUN: shutdown suppressed (would run: shutdown -h now)")
-                else:
-                    call("sudo nohup shutdown -h now", shell=True)
+                shutdown_now(args.dry_run)
                 time.sleep(30)
+
+            if iterations_remaining > 0:
+                iterations_remaining -= 1
+                if iterations_remaining == 0:
+                    log("Test iterations complete. Exiting.")
+                    break
 
             time.sleep(args.sleep)
 
@@ -244,7 +337,8 @@ def main():
         log(f"An unhandled exception occurred: {e}")
         cleanup_and_exit()
 
+    cleanup_and_exit()
+
 
 if __name__ == "__main__":
     main()
-
